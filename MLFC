@@ -1,0 +1,1516 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "import itertools\n",
+    "import statsmodels\n",
+    "from statsmodels.tsa.arima_model import ARIMA\n",
+    "from statsmodels.tsa.seasonal import seasonal_decompose\n",
+    "from statsmodels.nonparametric.smoothers_lowess import lowess\n",
+    "import warnings\n",
+    "warnings.filterwarnings('ignore')\n",
+    "group_cols =['Category', 'Segment', 'Driver', 'Sub_Category', 'Account','Date']\n",
+    "from statsmodels.tsa.api import ExponentialSmoothing, SimpleExpSmoothing, Holt\n",
+    "from sklearn.preprocessing import LabelEncoder"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_data():\n",
+    "    sample_data = pd.read_csv('Sample5.csv', encoding='unicode_escape', parse_dates=['Date'], thousands=',')\n",
+    "    sample_data.sort_values(by=['Date'], axis=0, inplace=True)\n",
+    "    sample_data['Driver'] = 'With_Outlier'\n",
+    "    sample_data.reset_index(inplace = True, drop = True)\n",
+    "    return sample_data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def _remove_outlier_single_grain(ts, iqr_limit=1.5,residual_compute_method='stl',\n",
+    "                                 replace_with='median',output_outlier_score=False):\n",
+    "\n",
+    "\n",
+    "    if residual_compute_method == 'stl':\n",
+    "        stl = seasonal_decompose(ts['Value'])\n",
+    "        residual = stl.resid.values\n",
+    "    elif residual_compute_method == 'lowess':\n",
+    "        # Get residual from lowess smoother\n",
+    "        x = np.array(range(1, len(ts) + 1))\n",
+    "        ts_smoothed = lowess(endog=ts.Value, exog=x,is_sorted=True, missing='none',return_sorted=False)\n",
+    "        residual = ts.Value - ts_smoothed\n",
+    "\n",
+    "    residual_non_nan = residual[~np.isnan(residual)]\n",
+    "    quantile_25 = np.percentile(residual_non_nan, 25)\n",
+    "    quantile_75 = np.percentile(residual_non_nan, 75)\n",
+    "    iqr = quantile_75 - quantile_25\n",
+    "\n",
+    "    limits = (quantile_25 - iqr_limit * iqr, quantile_75 + iqr_limit * iqr)\n",
+    "\n",
+    "    lower_limit_score = (residual - limits[0]) / iqr\n",
+    "    lower_limit_score[np.isnan(lower_limit_score)] = 0\n",
+    "    lower_limit_score[lower_limit_score > 0] = 0\n",
+    "\n",
+    "    upper_limit_score = (residual - limits[1]) / iqr\n",
+    "    # With stl decomposition, we get nan outlier scores at the beginning and\n",
+    "    #  end of the time series, because the residuals are nans.\n",
+    "    upper_limit_score[np.isnan(upper_limit_score)] = 0\n",
+    "    upper_limit_score[upper_limit_score < 0] = 0\n",
+    "\n",
+    "    outlier_score = abs(lower_limit_score) + upper_limit_score\n",
+    "\n",
+    "    if replace_with == 'nan':\n",
+    "        np.place(ts.Value.values, outlier_score > 0, np.nan)\n",
+    "    elif replace_with == 'iqr_bound':\n",
+    "        ts_values_non_nan = ts.Value[~np.isnan(ts.Value)]\n",
+    "        ts_quantile_25 = np.percentile(ts_values_non_nan, 25)\n",
+    "        ts_quantile_75 = np.percentile(ts_values_non_nan, 75)\n",
+    "        np.place(ts.Value.values, lower_limit_score < 0, ts_quantile_25)\n",
+    "        np.place(ts.Value.values, upper_limit_score > 0, ts_quantile_75)\n",
+    "    elif replace_with == 'mean':\n",
+    "        np.place(ts.Value.values, outlier_score > 0, np.mean(ts.Value[~np.isnan(ts.Value)]))\n",
+    "    elif replace_with == 'median':\n",
+    "        np.place(ts.Value.values, outlier_score > 0, np.median(ts.Value[~np.isnan(ts.Value)]))\n",
+    "\n",
+    "    if replace_with:\n",
+    "        pass\n",
+    "\n",
+    "    if output_outlier_score:\n",
+    "        ts['outlier_score'] = outlier_score\n",
+    "\n",
+    "    return ts"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def remove_outlier(timeseries, iqr_limit=1.5, residual_compute_method='stl', group_cols=None,\n",
+    "                   replace_with='nan', output_outlier_score=False):\n",
+    "    ## Check if timeseries has multiple categorical columns\n",
+    "\n",
+    "    cleaned_timeseries = pd.DataFrame()\n",
+    "    new_group = [x for x in group_cols if x != 'Date']\n",
+    "    dict_of_dataframes = {key: value for key, value in timeseries.groupby(new_group)}\n",
+    "    missed_df = pd.DataFrame()\n",
+    "    for number in range(len(dict_of_dataframes)):\n",
+    "\n",
+    "        try:\n",
+    "\n",
+    "            temp_df = dict_of_dataframes[list(dict_of_dataframes)[number]].reset_index()\n",
+    "            temp_df.set_index('Date', inplace=True)\n",
+    "            temp_df.sort_index(inplace=True)\n",
+    "            temp_df.columns = temp_df.columns.str.replace(' ', '')\n",
+    "            \n",
+    "            temp_df = _remove_outlier_single_grain(temp_df, iqr_limit=1.5, residual_compute_method=residual_compute_method,\n",
+    "                                                       replace_with=replace_with, output_outlier_score=False)\n",
+    "            cleaned_timeseries = pd.concat([cleaned_timeseries, temp_df])\n",
+    "            \n",
+    "        except:\n",
+    "            print('Error in time series. Please check.')\n",
+    "            missed_df = pd.concat([missed_df, temp_df[new_group].head(1)])\n",
+    "    if 'index' in cleaned_timeseries.columns.values:\n",
+    "        cleaned_timeseries.drop('index', axis = 1, inplace = True)    \n",
+    "    return cleaned_timeseries, missed_df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def treat_outliers(tsdf, group_cols = None):\n",
+    "    ##This functions trests outlier and append a copy of orginal\n",
+    "    ##tsdf with treated values\n",
+    "    print(\"Outlier treamtment started..\")\n",
+    "    \n",
+    "    #Method 1: Capping\n",
+    "    tsdf1, missing_df = remove_outlier(tsdf, residual_compute_method='lowess', replace_with='iqr_bound', group_cols = group_cols)\n",
+    "    tsdf1['Driver'] = 'Outlier_Capped_IQR'\n",
+    "    print('Outlier_Capped_IQR Shape', tsdf1.shape)\n",
+    "    print(\"..Capped IQR done\")\n",
+    "\n",
+    "    \n",
+    "    #Method 2: Linear Interpolation\n",
+    "    tsdf2,missed_df = remove_outlier(tsdf, residual_compute_method='lowess',group_cols = group_cols)\n",
+    "    tsdf2.interpolate(method = 'linear',inplace = True)\n",
+    "    tsdf2['Driver'] = 'Outlier_Linear'\n",
+    "    print('Outlier_Linear Imputation Shape', tsdf2.shape)\n",
+    "    print(\"..Outlier_Linear imputation done\")\n",
+    "    \n",
+    "    #Method 3: KNN -- Needs to be added.\n",
+    "    \n",
+    "    \n",
+    "    if tsdf.index.name !='Date':\n",
+    "        tsdf.set_index('Date', inplace=True)\n",
+    "    whole_df = pd.concat([tsdf, tsdf1,tsdf2],ignore_index =False)\n",
+    "    print(\"..outlier done!!\")\n",
+    "    return whole_df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def compute_ts_snaive_model(train_tsdf, test_tsdf): #, r_series_freq='MS',r_series_seasonality=12 ):\n",
+    "#     print('Running SNAV....', end=\"\")\n",
+    "    dates = (test_tsdf['Date'] - np.timedelta64(1, 'Y')+ np.timedelta64(1, 'D')).values.astype('datetime64[D]')\n",
+    "    seasonal_naive = train_tsdf[train_tsdf['Date'].isin(dates)]['Value'] # seasonal naive prediction\n",
+    "    y_hat_sn = test_tsdf.copy()#.drop('Value', axis=1)\n",
+    "    y_hat_sn['PointForecast'] = pd.DataFrame(seasonal_naive).set_index(test_tsdf.index)\n",
+    "    y_hat_sn['ModelName']='SeasonalNaive'\n",
+    "    y_hat_sn.drop('Value', axis =1,inplace = True)\n",
+    "    y_hat_sn.set_index('Date',inplace = True)\n",
+    "#     mape_value=mape(test_tsdf,y_hat_sn) # calling the mape function inside\n",
+    "    return y_hat_sn\n",
+    "\n",
+    "    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def mape(Value, y_pred): \n",
+    "    y_true, y_pred = np.array(Value), np.array(y_pred)\n",
+    "    mape_snaive=np.mean(np.abs((np.subtract(y_true , y_pred)) / y_true)*100) \n",
+    "    return mape_snaive"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# def compute_nnet(train_ts, test_ts, return_ensemble_input = True):\n",
+    "\n",
+    "    \n",
+    "#     from sklearn.preprocessing import LabelEncoder \n",
+    "#     objects_list = train_ts.select_dtypes(['object']).columns\n",
+    "#     for column in objects_list:\n",
+    "#     #     print(column)\n",
+    "#         encoder = LabelEncoder()\n",
+    "#         encoder.fit(train_ts[column])\n",
+    "#         train_ts[column] = encoder.transform(train_ts[column])\n",
+    "#         test_ts[column] = encoder.transform(test_ts[column]) \n",
+    "#     X=train_ts.drop(['Value','Date'],axis=1)\n",
+    "#     Y=train_ts['Value']\n",
+    "#     x=test_ts.drop(['Value','Date'],axis=1)\n",
+    "#     nnModel.fit(X,Y)\n",
+    "#     results_nn = nnModel.predict(x)\n",
+    "#     test_ts.reset_index(inplace=True,drop=True)\n",
+    "#     results_nn=pd.concat([test_ts,pd.Series(results_nn)],axis=1,ignore_index=False)\n",
+    "#     results_nn.rename({0:'PointForecast'},axis=1,inplace=True) \n",
+    "#     if 'origin' in results_nn:\n",
+    "#         results_nn = results_nn.drop(['origin'], axis=1)\n",
+    "#     results_nn['ModelName'] = 'NeuralNet'\n",
+    "#     print('..forecast produced!!', end =\"\")\n",
+    "#     ''' Creating data for nn ensemble- predicting on the train data set and the predicted values \n",
+    "#     become one of the input params'''\n",
+    "#     results_nn_en = pd.DataFrame()\n",
+    "#     return_ensemble_input=1\n",
+    "#     if return_ensemble_input:\n",
+    "#         results_nn_en = nnModel.predict(X)\n",
+    "#         train_ts.reset_index(inplace=True,drop=True)\n",
+    "#         results_nn_en=pd.concat([train_ts,pd.Series(results_nn_en)],axis=1,ignore_index=False)\n",
+    "#         results_nn_en.rename({0:'PointForecast'},axis=1,inplace=True)\n",
+    "#         results_nn_en['ModelName'] = 'NeuralNet'\n",
+    "#     return results_nn, results_nn_en"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def grid_search_exp_sm(ts1, ts2, horizon=3):\n",
+    "    forecast_list = []\n",
+    "    seasonality = np.arange(2,13,1)\n",
+    "    seasonal =['add']\n",
+    "    trend = ['add']\n",
+    "    for i in seasonal:\n",
+    "        for j in seasonality:\n",
+    "            for k in trend:\n",
+    "                fit = ExponentialSmoothing(ts1, seasonal_periods=j, trend=k, seasonal=i).fit()\n",
+    "                forecasts=fit.forecast(horizon)\n",
+    "#                 print (forecasts)\n",
+    "                error = mape(ts2,forecasts)\n",
+    "                forecast_list.append({'Trend': k,'Seasonality': j, 'seasonal': i, 'Mape':error,'method' :'Exponential'})\n",
+    "    forecast_list = pd.DataFrame(forecast_list).sort_values(by =['Mape'])\n",
+    "    return forecast_list"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def simple_exp_sm(ts1,ts2,horizon):\n",
+    "    forecast_list = []\n",
+    "    smoothing_level = np.arange(0.01,1.01,.01)\n",
+    "    for i in smoothing_level:        \n",
+    "        fit = SimpleExpSmoothing(ts1).fit(smoothing_level=i,optimized=False)\n",
+    "        forecasts = fit.forecast(horizon)\n",
+    "        error = mape(ts2,forecasts)\n",
+    "        forecast_list.append({'smoothing_level': i, 'Mape':error, 'method': 'Simple Exp'})\n",
+    "    forecast_list = pd.DataFrame(forecast_list).sort_values(by =['Mape'])\n",
+    "    return forecast_list"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def holts(ts1,ts2,horizon): # triple smoothing\n",
+    "    forecast_list = []\n",
+    "    smoothing_level = np.arange(0.1,1.1,0.1)\n",
+    "    smoothing_slope = np.arange(0.1,1.1,0.1)\n",
+    "    for i in smoothing_level:  \n",
+    "        for j in smoothing_slope:\n",
+    "            fit = Holt(ts1).fit(smoothing_level=i, smoothing_slope=j, optimized=False)\n",
+    "            forecast = fit.forecast(horizon)\n",
+    "            error = mape(ts2,forecast)\n",
+    "            forecast_list.append({'smoothing_level': i,'smoothing_slope' : j,'Mape':error, 'method' :  'Holt'})\n",
+    "    forecast_list = pd.DataFrame(forecast_list).sort_values(by =['Mape'])\n",
+    "    return forecast_list"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def _compute_arima_per_grain(ts,test_size,month_iter):\n",
+    "#ts=temp_df\n",
+    "    \n",
+    "    forecast_concat = pd.DataFrame()\n",
+    "    arima_forecast= pd.DataFrame()\n",
+    "    arima_order_errors=pd.DataFrame()\n",
+    "\n",
+    "    print(\"month iteration is : \",month_iter)\n",
+    "    p  = range(0, 3)\n",
+    "    d = q = range(0,3)\n",
+    "    pdq = list(itertools.product(p, d, q))\n",
+    "    \n",
+    "    train_ts, test_ts = ts[0:len(ts)-month_iter-test_size],ts[len(ts)-month_iter-test_size:len(ts)-month_iter]\n",
+    "    print(\"train_size :\",len(train_ts),\"test_size :\",len(test_ts)) \n",
+    "    \n",
+    "    history = [x for x in train_ts.Value]\n",
+    "    test_ts.reset_index(inplace=True)\n",
+    "\n",
+    "    for x in pdq:\n",
+    "        arima_order = list(x)\n",
+    "        print(arima_order)\n",
+    "        try:\n",
+    "            arima_model = ARIMA(history, arima_order)\n",
+    "            arima_fit = arima_model.fit(disp=0)\n",
+    "            arima_output = arima_fit.forecast(test_size)\n",
+    "            yhat = pd.DataFrame(arima_output[0])\n",
+    "            yhat.columns=['PointForecast']\n",
+    "            yhat['ModelName']='Arima'\n",
+    "            yhat['param_val']='{}'.format(arima_order)\n",
+    "            forecast_concat=pd.concat([test_ts,yhat],axis=1)\n",
+    "            arima_forecast=arima_forecast.append(forecast_concat)\n",
+    "        except:\n",
+    "            print(arima_order, 'error...', end=\"\")\n",
+    "            arima_order_errors=arima_order_errors.append(arima_order)\n",
+    "            continue\n",
+    "    return arima_forecast"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_best_forecasts(ts1,ts2,horizon=1):\n",
+    "    print('Smoothing started')\n",
+    "    forecast = pd.DataFrame()\n",
+    "    forecast_df1 = grid_search_exp_sm(ts1,ts2,horizon)\n",
+    "    forecast_df2 = simple_exp_sm(ts1,ts2,horizon)\n",
+    "    forecast_df3 = holts(ts1,ts2,horizon)\n",
+    "    final_df = pd.concat([forecast_df1.head(1),forecast_df2.head(1),forecast_df3.head(1)])\n",
+    "    final_df = final_df.sort_values(by =['Mape'])\n",
+    "    final_df.fillna('NA', inplace = True)\n",
+    "    final_df.reset_index(drop = True)\n",
+    "    method = final_df['method'].head(1)\n",
+    "    if method.item() =='Exponential':\n",
+    "        print('Triple Exponential Method Chosen')\n",
+    "        seasonality = forecast_df1['Seasonality'].head(1).item()\n",
+    "        trend = forecast_df1['Trend'].head(1).item()\n",
+    "        seasonal = forecast_df1['seasonal'].head(1).item()\n",
+    "        fit = ExponentialSmoothing(ts1, seasonal_periods=seasonality, trend=trend, seasonal=seasonal).fit()\n",
+    "        fitted = fit.predict(ts1.index.min(),ts1.index.max())\n",
+    "        forecast = (fit.forecast(horizon))\n",
+    "    elif method.item() =='Simple Exp':\n",
+    "        print('Simple Method Chosen')\n",
+    "        smoothing_level = forecast_df2['smoothing_level'].head(1).item()\n",
+    "        fit = SimpleExpSmoothing(ts1).fit(smoothing_level=smoothing_level,optimized=False)\n",
+    "        fitted = fit.predict(ts1.index.min(),ts1.index.max())\n",
+    "        forecast = (fit.forecast(horizon))\n",
+    "    elif method.item() =='Holt':\n",
+    "        print('Holt Method Chosen')\n",
+    "        smoothing_level = forecast_df3['smoothing_level'].head(1).item()\n",
+    "        smoothing_slope = forecast_df3['smoothing_slope'].head(1).item()\n",
+    "        fit = Holt(ts1).fit(smoothing_level=smoothing_level, smoothing_slope=smoothing_slope, optimized=False)\n",
+    "        fitted = fit.predict(ts1.index.min(),ts1.index.max())\n",
+    "        forecast = fit.forecast(horizon)\n",
+    "        \n",
+    "    forecast = pd.DataFrame({'Date':ts2.index, 'PointForecast':forecast.values}).set_index('Date')\n",
+    "    forecast['ModelName']= 'ETS'\n",
+    "    fitted = pd.DataFrame({'Date':ts1.index, 'ETS':fitted.values}).set_index('Date')\n",
+    "    return forecast,final_df,fitted"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def compute_arima(ts,test_size,month):\n",
+    "#    ts=tsdf\n",
+    "#    test_size=1\n",
+    "\n",
+    "    def month_diff(d1, d2):\n",
+    "        return (d1.year - d2.year) * 12 + (d1.month - d2.month)\n",
+    "    \n",
+    "    results_arima=pd.DataFrame()\n",
+    "    new_group = [x for x in group_cols if x != 'Date']\n",
+    "    dict_of_dataframes = {key: value for key, value in ts.groupby(new_group)}\n",
+    "    number_of_ts=len(dict_of_dataframes)\n",
+    "        \n",
+    "    for number in range(len(dict_of_dataframes)):\n",
+    "    #number=3 \n",
+    "        print(\"Time series number :\",number)\n",
+    "        try:\n",
+    "            temp_df = dict_of_dataframes[list(dict_of_dataframes)[number]].reset_index()\n",
+    "            #temp_df['Date']=temp_df.to\n",
+    "            temp_df.set_index('Date', inplace=True)\n",
+    "            temp_df.sort_index(inplace=True)\n",
+    "            print((month_diff(temp_df.index.max(),temp_df.index.min())+1),len(temp_df))\n",
+    "            if (month_diff(temp_df.index.max(),temp_df.index.min())+1)==len(temp_df):\n",
+    "                temp_df =_compute_arima_per_grain(temp_df,test_size,month)\n",
+    "                results_arima=results_arima.append(temp_df)\n",
+    "            else:\n",
+    "                 print(\"Time series has missing values\")\n",
+    "        except:\n",
+    "            print('Error in time series. Please check.')\n",
+    "        continue\n",
+    "    return results_arima,number_of_ts"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def make_grains(timeseries, group_cols = None):\n",
+    "    cleaned_timeseries = pd.DataFrame()\n",
+    "    new_group = [x for x in group_cols if x != 'Date']\n",
+    "    dict_of_dataframes = {key: value for key, value in timeseries.groupby(new_group)}\n",
+    "    return dict_of_dataframes"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Calling Seasonal Naive Forecast"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "snaive_data = get_data()\n",
+    "dict_of_dataframes = make_grains(snaive_data,group_cols)\n",
+    "final_snaive_df = pd.DataFrame()\n",
+    "horizon = 1\n",
+    "for number in range(len(dict_of_dataframes)):\n",
+    "    ts = dict_of_dataframes[list(dict_of_dataframes)[number]].set_index('Date')\n",
+    "    train,test = ts[:-horizon],ts[-horizon:]\n",
+    "    forecasts_naive = compute_ts_snaive_model(train['Value'].reset_index(),test['Value'].reset_index()) ## Reset Index Because SNaive needs data as column and not index\n",
+    "    merged_df = pd.merge(test,forecasts_naive,left_index = True, right_index = True)\n",
+    "    final_snaive_df = pd.concat([final_snaive_df, merged_df])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "final_snaive_df.reset_index(inplace = True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# final_snaive_df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Calling Smoothing method"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "%%time\n",
+    "ets_data = get_data()\n",
+    "outlier_treated_ets = treat_outliers(ets_data, group_cols = group_cols)\n",
+    "dict_of_dataframes = make_grains(outlier_treated_ets,group_cols)\n",
+    "forecast_ets_df = pd.DataFrame()\n",
+    "fitted_ets_df = pd.DataFrame()\n",
+    "\n",
+    "horizon = 1\n",
+    "print('Total number of timeseries = ', len(dict_of_dataframes))\n",
+    "for number in range(len(dict_of_dataframes)):\n",
+    "    ts = dict_of_dataframes[list(dict_of_dataframes)[number]]\n",
+    "    train,test = ts[:-horizon],ts[-horizon:]\n",
+    "    forecasts_ets, mape_df,fitted_ets = get_best_forecasts(train['Value'],test['Value'], horizon = horizon)\n",
+    "    merged_df = pd.merge(test,forecasts_ets,left_index = True, right_index = True)\n",
+    "    fitted_df = pd.merge(train,fitted_ets,left_index = True, right_index = True)\n",
+    "    forecast_ets_df = pd.concat([forecast_ets_df, merged_df])\n",
+    "    fitted_ets_df = pd.concat([fitted_ets_df, fitted_df])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "forecast_ets_df.reset_index(inplace =True)\n",
+    "forecast_ets_df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Calling ARIMA"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "arima_data = get_data()\n",
+    "tsdf=treat_outliers(arima_data,group_cols)                                        \n",
+    "all_results_arima=pd.DataFrame()\n",
+    "\n",
+    "for month in range(0,2):\n",
+    "#month=1\n",
+    "    test_size=2  \n",
+    "    results_arima,number_of_ts = compute_arima(tsdf,test_size,month)\n",
+    "    all_results_arima=all_results_arima.append(results_arima)\n",
+    "\n",
+    "    print('------------------------Arima iteration ',month,' completed!!-----------------' )\n",
+    "    print(\" --Total number of TS processed : \",number_of_ts,\"\\n\",\"--Shape of ARIMA output :\",results_arima.shape)                                                          "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "all_results_arima"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# missed_df = pd.DataFrame()\n",
+    "#     for number in range(len(dict_of_dataframes)):\n",
+    "#         try:\n",
+    "#             temp_df = dict_of_dataframes[list(dict_of_dataframes)[number]].reset_index()\n",
+    "#             temp_df.set_index('Date', inplace=True)\n",
+    "#             temp_df.sort_index(inplace=True)\n",
+    "#             temp_df.columns = temp_df.columns.str.replace(' ', '')\n",
+    "# #             print(temp_df)\n",
+    "#             if len(temp_df) < 18:\n",
+    "#                 pass\n",
+    "#                 #call Naive, SNaive, MA\n",
+    "#             else:\n",
+    "#                 #arima + ets + snaive\n",
+    "#                 print('ETS Started')\n",
+    "#                 forecast_ets,mape_values_df = get_best_forecasts(temp_df['Value'][:-horizon],temp_df['Value'][-horizon:],horizon=horizon)\n",
+    "#                 print('ETS Done')\n",
+    "#                 print('Snaive started')\n",
+    "#                 forecast_snaive = compute_ts_snaive_model(temp_df.reset_index()[['Date','Value']][:-horizon],temp_df.reset_index()[['Date','Value']][-horizon:])\n",
+    "# #                 print(forecast_ets)\n",
+    "# #                 print(forecast_snaive)\n",
+    "#                 print('Snaive done')\n",
+    "#             cleaned_timeseries = pd.concat([cleaned_timeseries, forecast_ets,forecast_snaive])\n",
+    "            \n",
+    "#         except:\n",
+    "#             print('Error in time series. Please check.')\n",
+    "#             missed_df = pd.concat([missed_df, temp_df[new_group].head(1)])\n",
+    "#     if 'index' in cleaned_timeseries.columns.values:\n",
+    "#         cleaned_timeseries.drop('index', axis = 1, inplace = True)    \n",
+    "#     return cleaned_timeseries, missed_df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### ML"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sklearn.linear_model import Lasso\n",
+    "from sklearn.linear_model import ElasticNet\n",
+    "from sklearn.neighbors import KNeighborsRegressor\n",
+    "from sklearn.ensemble import RandomForestRegressor\n",
+    "from sklearn.ensemble import GradientBoostingRegressor\n",
+    "from sklearn.neural_network import MLPRegressor\n",
+    "from sklearn.pipeline import Pipeline"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "lasso_model=Lasso()\n",
+    "elastic_net_model=ElasticNet()\n",
+    "knn_model=KNeighborsRegressor(n_neighbors=5,algorithm='auto',leaf_size=30, p=2, metric='minkowski',metric_params=None,n_jobs=None)\n",
+    "random_forest_model=RandomForestRegressor(n_estimators=10,criterion='mse', max_depth=5,min_samples_split=2,min_samples_leaf=1,\n",
+    "                              min_weight_fraction_leaf=0.0,max_features='auto',max_leaf_nodes=None,\n",
+    "                             min_impurity_decrease=0.0,min_impurity_split=None,bootstrap=True, n_jobs=1,\n",
+    "                             oob_score=False, random_state=None, verbose=0, warm_start=False)\n",
+    "boosted_trees_model=GradientBoostingRegressor(loss='ls', learning_rate=0.1, n_estimators=50, subsample=0.80000000000000004,\n",
+    "                                     criterion='friedman_mse',min_samples_split=2, min_samples_leaf=1, \n",
+    "                                     min_weight_fraction_leaf=0.0, max_depth=3, min_impurity_decrease=0.0, \n",
+    "                                     min_impurity_split=None, init=None, random_state=None, max_features=None,\n",
+    "                                    verbose=0, max_leaf_nodes=None,warm_start=False, presort='auto', \n",
+    "                                     validation_fraction=0.1, n_iter_no_change=None, tol=0.0001)\n",
+    "nnModel= MLPRegressor(hidden_layer_sizes=(10,10), \n",
+    "                                activation=\"relu\", \n",
+    "                                solver='lbfgs', \n",
+    "                                learning_rate='adaptive',\n",
+    "                                verbose=True)   #****make_grain_features=True---- this needs to be handeled\n",
+    "\n",
+    "\n",
+    "########### ENSEMBLE MODELS #############\n",
+    "\n",
+    "lasso_model_en=Lasso()\n",
+    "elastic_net_model_en=ElasticNet()\n",
+    "knn_model_en=KNeighborsRegressor(n_neighbors=5,algorithm='auto',leaf_size=30, p=2, metric='minkowski',\\\n",
+    "                              metric_params=None,n_jobs=None)\n",
+    "random_forest_model=RandomForestRegressor(n_estimators=10,criterion='mse', max_depth=5,min_samples_split=2,min_samples_leaf=1,\n",
+    "                              min_weight_fraction_leaf=0.0,max_features='auto',max_leaf_nodes=None,\n",
+    "                             min_impurity_decrease=0.0,min_impurity_split=None,bootstrap=True, n_jobs=1,\n",
+    "                             oob_score=False, random_state=None, verbose=0, warm_start=False)\n",
+    "boosted_trees_model_en=GradientBoostingRegressor(loss='ls', learning_rate=0.1, n_estimators=50, subsample=0.80000000000000004,\n",
+    "                                     criterion='friedman_mse',min_samples_split=2, min_samples_leaf=1, \n",
+    "                                     min_weight_fraction_leaf=0.0, max_depth=3, min_impurity_decrease=0.0, \n",
+    "                                     min_impurity_split=None, init=None, random_state=None, max_features=None,\n",
+    "                                    verbose=0, max_leaf_nodes=None,warm_start=False, presort='auto', \n",
+    "                                     validation_fraction=0.1, n_iter_no_change=None, tol=0.0001)\n",
+    "nnModel_en= MLPRegressor(hidden_layer_sizes=(10,10), \n",
+    "                                activation=\"relu\", \n",
+    "                                solver='lbfgs', \n",
+    "                                learning_rate='adaptive',\n",
+    "                                verbose=True)   #****make_grain_features=True---- this needs to be handeled"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Data Prep stage"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from collections import defaultdict\n",
+    "from sklearn.preprocessing import LabelEncoder\n",
+    "\n",
+    "from tsfresh import select_features, extract_features\n",
+    "from tsfresh.utilities.dataframe_functions import impute,make_forecasting_frame\n",
+    "data = get_data()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### a. Grain Features using TSFresh"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df_shift, y = make_forecasting_frame(data[\"Value\"], kind=\"price\", max_timeshift=12, rolling_direction=1)\n",
+    "X = extract_features(df_shift, column_id=\"id\", column_sort=\"time\", column_value=\"value\", impute_function=impute,show_warnings=False)\n",
+    "X.reset_index(inplace = True, drop = True)\n",
+    "y.reset_index(inplace = True, drop = True)\n",
+    "df_=select_features(X,y)\n",
+    "print(\"Generated dataset has %d rows and %d columns\" % (df_.shape[0],df_.shape[1]))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### b. Time Featurizer"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import datetime as dt\n",
+    "timefeaturizer_df=pd.DataFrame()\n",
+    "timefeaturizer_df['Date']=pd.to_datetime(data['Date'])\n",
+    "timefeaturizer_df['Year'] = data['Date'].dt.year\n",
+    "timefeaturizer_df['Month'] = data['Date'].dt.month\n",
+    "timefeaturizer_df['Quarter'] = data['Date'].dt.quarter\n",
+    "timefeaturizer_df['No_days_in_month'] = data['Date'].dt.days_in_month\n",
+    "# timefeaturizer_df.drop('Date',inplace=True,axis=1)\n",
+    "timefeaturizer_df.reset_index(inplace = True, drop = True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### c. Preparing Dataset by combining grain & time features"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "## Label Encoding Features\n",
+    "\n",
+    "le_dict = defaultdict(LabelEncoder)\n",
+    "# Selecting only object datatype columns for LabelEncoder\n",
+    "objects_list = data.select_dtypes(['object']).columns \n",
+    "labelencoders =  data[objects_list].apply(lambda x: le_dict[x.name].fit_transform(x))\n",
+    "labelencoders.reset_index(inplace = True, drop = True)\n",
+    "labelencoders = pd.concat([labelencoders, data[['Value']]], ignore_index = False, axis =1)\n",
+    "featurized_df= pd.merge(timefeaturizer_df, df_,how = 'left',left_index = True, right_index = True)\n",
+    "featurized_df= pd.merge(featurized_df,labelencoders,how ='left',left_index = True, right_index = True)\n",
+    "featurized_df.fillna(0,inplace = True)\n",
+    "\n",
+    "# Using the dictionary to label future data\n",
+    "# new_data = data[objects_list].apply(lambda x: le_dict[x.name].transform(x))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# featurized_df.head()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Inverse the encoded"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# labelencoders.apply(lambda x: d[x.name].inverse_transform(x))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Main"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# data=get_data()\n",
+    "predict_all=pd.DataFrame()\n",
+    "fitted_all=pd.DataFrame()\n",
+    "\n",
+    "horizon = 1\n",
+    "\n",
+    "'''\n",
+    "Predicted/ Forecasted values on test data are concaneted on 0 axis (row-wise)\n",
+    "\n",
+    "Fitted Values or predicted values on train data are concatenated on 1 axis (column-wise) -- to prepare data for Ensemble models\n",
+    "\n",
+    "'''\n",
+    "lags=[1,2,3,6,12,13] \n",
+    "''' created 13 as 13th lag will be dropped first...which is not significant'''\n",
+    "for i in lags:\n",
+    "    col_name = 'Value_lag{}'.format(i)\n",
+    "    data[col_name] = featurized_df['Value'].shift(i) \n",
+    "    data[col_name] = featurized_df.apply(lambda x: x[\"Value\"] if np.isnan(x[col_name]) else x[col_name], axis =1) \n",
+    "    \n",
+    "''' taking individual lags by dropping'''\n",
+    "for i in reversed(lags):\n",
+    "    col_name = 'Value_lag{}'.format(i)\n",
+    "    featurized_df=featurized_df.drop([col_name],axis=1)\n",
+    "    \n",
+    "    \n",
+    "\n",
+    "    train_ts = featurized_df[:-horizon]\n",
+    "    test_ts = featurized_df[-horizon:]\n",
+    "    \n",
+    "    train_ts_copy =train_ts.copy()\n",
+    "    test_ts_copy = test_ts.copy()\n",
+    "    \n",
+    "    X=train_ts.drop(['Value','Date'],axis=1)\n",
+    "    Y=train_ts['Value']\n",
+    "    x=test_ts.drop(['Value','Date'],axis=1)\n",
+    "    lasso_model.fit(X,Y)\n",
+    "    lasso_pred=pd.DataFrame(lasso_model.predict(x)) #test\n",
+    "    lasso_pred.columns = ['PointForecast']\n",
+    "    lasso_pred['ModelName'] = 'lasso'\n",
+    "    lasso_fitted=lasso_model.predict(X)# train\n",
+    "\n",
+    "    elastic_net_model.fit(X,Y)\n",
+    "    elastic_pred=pd.DataFrame(elastic_net_model.predict(x))# test\n",
+    "    elastic_pred.columns = ['PointForecast']\n",
+    "    elastic_pred['ModelName'] ='elastic'\n",
+    "    elastic_fitted=elastic_net_model.predict(X)# train\n",
+    "\n",
+    "    knn_model.fit(X,Y)\n",
+    "    knn_model_pred=pd.DataFrame(knn_model.predict(x))# test\n",
+    "    knn_model_pred.columns = ['PointForecast']\n",
+    "    knn_model_pred['ModelName'] = 'knn'\n",
+    "    knn_model_fitted=knn_model.predict(X)# train\n",
+    "\n",
+    "    random_forest_model.fit(X,Y)\n",
+    "    random_forest_model_pred=pd.DataFrame(random_forest_model.predict(x))# test\n",
+    "    random_forest_model_pred.columns = ['PointForecast']\n",
+    "    random_forest_model_pred['ModelName'] = 'randomforest'\n",
+    "    random_forest_model_fitted=random_forest_model.predict(X)# train\n",
+    "\n",
+    "    boosted_trees_model.fit(X,Y)\n",
+    "    boosted_trees_model_pred=pd.DataFrame(boosted_trees_model.predict(x))# test\n",
+    "    boosted_trees_model_pred.columns = ['PointForecast']\n",
+    "    boosted_trees_model_pred['ModelName']='boosted'\n",
+    "    boosted_trees_model_fitted=boosted_trees_model.predict(X)# train\n",
+    "    \n",
+    "    nnModel.fit(X,Y)\n",
+    "    nn_model_pred=pd.DataFrame(nnModel.predict(x))\n",
+    "    nn_model_pred.columns = ['PointForecast']\n",
+    "    nn_model_pred['ModelName'] = 'neuralnet'\n",
+    "    nn_model_fitted=nnModel.predict(X)\n",
+    "\n",
+    "    ''' Concating all the ml model results ...... ml_union alternative'''\n",
+    "#     ml_union_pred_= pd.DataFrame(np.stack([lasso_pred,elastic_pred,knn_model_pred,random_forest_model_pred,boosted_trees_model_pred,\\\n",
+    "#                              nn_model_pred],axis=1))\n",
+    "    ### _pred are concatenaed on 0 axis (row-wise)\n",
+    "    \n",
+    "    ml_union_pred_ = pd.concat([lasso_pred,elastic_pred,knn_model_pred,random_forest_model_pred,boosted_trees_model_pred,\\\n",
+    "                             nn_model_pred],axis =0)\n",
+    "    \n",
+    "    ### _fitted are concatenaed on 1 axis (column-wise)\n",
+    "    \n",
+    "    ml_union_fitted_= pd.DataFrame(np.stack([lasso_fitted,elastic_fitted,knn_model_fitted,random_forest_model_fitted,boosted_trees_model_fitted,\\\n",
+    "                             nn_model_fitted],axis=1))\n",
+    "    \n",
+    "\n",
+    "    ml_union_fitted_.columns = ['lasso','elastic','knn','randomforest','boosted','neuralnet']\n",
+    "\n",
+    "    test_ts.reset_index(drop=True,inplace=True)\n",
+    "    train_ts.reset_index(drop=True,inplace=True)\n",
+    "    \n",
+    "    ## Concatenating for column names category, subcategory and all\n",
+    "    \n",
+    "    ml_union_pred= pd.concat([test_ts,ml_union_pred_],axis=1,ignore_index=False)\n",
+    "    ml_union_fitted= pd.concat([train_ts,ml_union_fitted_],axis=1,ignore_index=False)\n",
+    "    \n",
+    "    \n",
+    "    if i==1:\n",
+    "        ml_union_fitted['param_val']='ml_with_lag{}'.format(0)\n",
+    "        ml_union_pred['param_val']='ml_with_lag{}'.format(0)\n",
+    "    else:\n",
+    "        try:\n",
+    "            ind=lags.index(i)\n",
+    "            a=lags[ind-1]\n",
+    "            ml_union_fitted['param_val']='ml_with_lag{}'.format(a)\n",
+    "            ml_union_pred['param_val']='ml_with_lag{}'.format(a)\n",
+    "        \n",
+    "        except:\n",
+    "            pass\n",
+    "    \n",
+    "    predict_all=pd.concat([predict_all,ml_union_pred],axis=0)\n",
+    "    fitted_all=pd.concat([fitted_all,ml_union_fitted],axis=0)\n",
+    "''' total iterations will be no of lags +1'''\n",
+    "\n",
+    "print('ML models ran sucessfully....')\n",
+    "\n",
+    "print('Imputing the Nan values with actual values')\n",
+    "for i in reversed(lags):\n",
+    "    col_name = 'Value_lag{}'.format(i)\n",
+    "    \n",
+    "    if i!=13:\n",
+    "        fitted_all[col_name]=fitted_all.apply(lambda x: x['Value'] if np.isnan(x[col_name]) else x[col_name], axis=1)\n",
+    "print('Nan Values imputed with Actual values...Done')   \n",
+    "\n",
+    "''' \n",
+    "for predict_all, should the Nan values for lag colummns be imputed with original Values .... or \n",
+    "these lags columns are not needed further ???\n",
+    "'''\n",
+    "\n",
+    "for i in reversed(lags):\n",
+    "    col_name = 'Value_lag{}'.format(i)\n",
+    "    if i!=13:\n",
+    "        predict_all.drop([col_name],axis=1,inplace=True)\n",
+    "print('Deleted the lag columns from predicted_all..')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# predict_all.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# fitted_all.head()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Concatenating ARIMA, Snaive & ETS"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ts_output_pred = pd.concat([all_results_arima,forecast_ets_df,final_snaive_df,predict_all],axis =0)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ts_output_pred"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Data Prep"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#### featuriser\n",
+    "from tsfresh import select_features, extract_features\n",
+    "from tsfresh.utilities.dataframe_functions import impute"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data = get_data()\n",
+    "data.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# import pandas as pd\n",
+    "# a=pd.read_csv(\"C:\\\\Users\\\\MalikM\\\\Documents\\\\MLFC\\\\Sample_Featurizer_1.csv\")\n",
+    "# a.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# b=a.drop('Date',axis=1)\n",
+    "c=a.drop('Driver',axis=1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# c.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data.dtypes"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data.head()\n",
+    "train_ts = data[:-6]\n",
+    "test_ts = data[-6:]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sklearn.preprocessing import LabelEncoder"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "objects_list = train_ts.select_dtypes(['object']).columns\n",
+    "for column in objects_list:\n",
+    "#     print(column)\n",
+    "    encoder = LabelEncoder()\n",
+    "    encoder.fit(train_ts[column])\n",
+    "    train_ts[column] = encoder.transform(train_ts[column])\n",
+    "    test_ts[column] = encoder.transform(test_ts[column])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df= c.drop('Value', axis=1)\n",
+    "y=c.loc[:,'Value']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sklearn.preprocessing import LabelEncoder\n",
+    "le= LabelEncoder()\n",
+    "df_le=df.copy()\n",
+    "df_le['Category']=le.fit_transform(df['Category'])\n",
+    "df_le['Segment']=le.fit_transform(df['Segment'])\n",
+    "df_le['Sub_Category']=le.fit_transform(df['Sub_Category'])\n",
+    "df_le['Account']=le.fit_transform(df['Account'])\n",
+    "# df_le.drop(['Category','Segment','Sub_Category','Account'],axis=1, inplace=True)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df_le['Account'].unique()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df_le=df_le.reset_index()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df_le.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X= extract_features(df_le,column_id='Date', column_sort=None)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# X"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#impute non finite values\n",
+    "# impute(X)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# X_filtered=select_features(X,y)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tsfresh.examples import download_robot_execution_failures\n",
+    "# df,y=tsfresh.examples.robot_execution_failures.download_robot_execution_failures\n",
+    "\n",
+    "df, y = load_robot_execution_failures()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df.id.unique()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df[(df['id']==1)]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "y.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df_=select_features(X,c)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#### https://github.com/blue-yonder/tsfresh/blob/master/notebooks/timeseries_forecasting_google_stock.ipynb"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pylab as plt\n",
+    "plt.style.use('seaborn')\n",
+    "import seaborn as sns\n",
+    "\n",
+    "from tsfresh import extract_features\n",
+    "from tsfresh.utilities.dataframe_functions import make_forecasting_frame\n",
+    "from sklearn.ensemble import AdaBoostRegressor\n",
+    "from tsfresh.utilities.dataframe_functions import impute\n",
+    "\n",
+    "# Fix needed to pandas datareader\n",
+    "pd.core.common.is_list_like = pd.api.types.is_list_like\n",
+    "# import pandas_datareader.data as web\n",
+    "import datetime\n",
+    "\n",
+    "import warnings\n",
+    "warnings.filterwarnings('ignore')\n",
+    "\n",
+    "from tqdm import tqdm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# import pandas as pd\n",
+    "# a=pd.read_csv(\"C:\\\\Users\\\\MalikM\\\\Documents\\\\MLFC\\\\Sample_Featurizer_1.csv\")\n",
+    "# a.tail()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df_shift, y = make_forecasting_frame(a[\"Value\"], kind=\"price\", max_timeshift=1, rolling_direction=1) \n",
+    "## this is with only 1 LAG, lags needs to be added as new features below"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df_shift[df_shift.value==-999.11]\n",
+    "df_shift.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# a.tail(3)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df_shift.head(2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df_shift.id.value_counts()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# y.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X = extract_features(df_shift, column_id=\"id\", column_sort=\"time\", column_value=\"value\", impute_function=impute,\n",
+    "                     show_warnings=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X.shape\n",
+    "X.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(X.shape)\n",
+    "X = X.loc[:, X.apply(pd.Series.nunique) != 1] \n",
+    "print(X.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X[\"feature_last_value\"] = y.shift(1) ##### add more lags here"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X = X.iloc[1:, ]\n",
+    "y = y.iloc[1: ]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(X.shape)\n",
+    "print(y.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "grainfeaturized_df=pd.concat([X,y],axis=1)\n",
+    "grainfeaturized_df.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ada = AdaBoostRegressor(n_estimators=10)\n",
+    "# y_pred = [np.NaN] * len(y)\n",
+    "\n",
+    "# isp = 1  # index of where to start the predictions\n",
+    "# # assert isp > 0\n",
+    "\n",
+    "# for i in tqdm(range(isp, len(y))):\n",
+    "    \n",
+    "#     ada.fit(X.iloc[:i], y[:i])\n",
+    "#     y_pred[i] = ada.predict(X.iloc[i, :].values.reshape((1, -1)))[0]\n",
+    "    \n",
+    "# y_pred = pd.Series(data=y_pred, index=y.index)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "\n",
+    "# create date time features of a dataset\n",
+    "# adding time featuriser to grainfeaturized_df\n",
+    "\n",
+    "import datetime as dt\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "timefeaturizer_df=pd.DataFrame()\n",
+    "timefeaturizer_df['Date']=pd.to_datetime(a['Date'])\n",
+    "timefeaturizer_df['year'] = a['Date'].dt.year\n",
+    "timefeaturizer_df['month'] = a['Date'].dt.month\n",
+    "#a['day'] = a['Date'].dt.dayofweek ## as of now monthly, so day and day of week shall not be included for now.\n",
+    "timefeaturizer_df['quarter'] = a['Date'].dt.quarter\n",
+    "timefeaturizer_df.drop('Date',inplace=True,axis=1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "timefeaturizer_df.head(10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(timefeaturizer_df.shape)\n",
+    "print(grainfeaturized_df.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "### concatenating timefeaturizer_df and grainfeaturized_df\n",
+    "featurized_df=pd.concat([timefeaturizer_df ,grainfeaturized_df], axis=1)\n",
+    "featurized_df.head()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
